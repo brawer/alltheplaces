@@ -17,6 +17,9 @@ from locations.user_agents import BOT_USER_AGENT_SCRAPY
 # per-station properties in memory.
 Station = namedtuple("Station", "name operator operator_wikidata city country means")
 
+# Means of transport that run on rails, as named in the feed.
+RAIL_MEANS = ("CABLE_RAILWAY", "METRO", "RACK_RAILWAY", "TRAIN", "TRAM")
+
 
 class OpentransportdataSwissSpider(Spider):
     name = "opentransportdata_swiss"
@@ -152,7 +155,7 @@ class OpentransportdataSwissSpider(Spider):
                 "wheelchair:conditional": wheelchair_cond,
                 "toilets:wheelchair": self.toilets_wheelchair.get(sloid),
             }
-            tags.update(self.means_tags(means, platform=False))
+            tags.update(self.means_tags(means, platform=None))
 
             lat, lon, ele = self.parse_lat_lon_ele(row)
             if lat == 0.0 or lon == 0.0:
@@ -183,16 +186,38 @@ class OpentransportdataSwissSpider(Spider):
         yield Request(url, callback=self.handle_traffic_points)
 
     def handle_traffic_points(self, response: Response) -> Iterable[Feature]:
-        for row in self.read_csv("actual-date-world-traffic-point", response):
-            # This table does not seem to have a status column,
-            # so we do not check for status="VALIDATED" here.
+        # The table has two kinds of rows. A BOARDING_AREA is a whole
+        # platform, such as "Perron 2" at Zürich HB. A BOARDING_PLATFORM
+        # is one place where vehicles stop, such as track 3; its
+        # parentSloid is its BOARDING_AREA if it has one.
+        # This table does not seem to have a status column,
+        # so we do not check for status="VALIDATED" here.
+        rows = list(self.read_csv("actual-date-world-traffic-point", response))
+        tracks = {}  # BOARDING_AREA sloid -> designations of its BOARDING_PLATFORMs
+        for row in rows:
+            parent = row["parentSloid"]
+            if row["trafficPointElementType"] == "BOARDING_PLATFORM" and parent and row["designation"]:
+                tracks.setdefault(parent, []).append(row["designation"])
+
+        for row in rows:
             sloid = row["sloid"]
-            station_sloid = row["parentSloid"]
+            station_sloid = row["parentSloidServicePoint"]
             if not station_sloid and sloid.startswith("ch:1:sloid:"):
                 station_sloid = ":".join(sloid.split(":")[:4])
             station = self.stations.get(station_sloid)
             if not station:
                 continue
+
+            is_area = row["trafficPointElementType"] == "BOARDING_AREA"
+            parent = row["parentSloid"]
+            has_area = not is_area and parent and parent != station_sloid
+            kind = self.platform_kind(station.means, is_area, has_area)
+            if not kind:
+                continue
+            if is_area:
+                local_ref = ";".join(sorted(set(tracks.get(sloid, [])), key=self.natural_key))
+            else:
+                local_ref = row["designation"]
 
             # Surprisingly, we don’t see in the data feed what means of
             # transportation are serving the platform, so we look at the
@@ -204,16 +229,16 @@ class OpentransportdataSwissSpider(Spider):
             if not wheelchair:
                 wheelchair, wheelchair_cond = self.wheelchair_tags(station_sloid, means)
             tags = {
-                "public_transport": "platform",
                 "name": station.name,
                 "operator": station.operator,
                 "operator:wikidata": station.operator_wikidata,
                 "ref:IFOPT": sloid,
+                "local_ref": local_ref,
                 "wheelchair": wheelchair,
                 "wheelchair:conditional": wheelchair_cond,
                 "toilets:wheelchair": self.toilets_wheelchair.get(sloid),
             }
-            tags.update(self.means_tags(station.means, platform=True))
+            tags.update(self.means_tags(station.means, platform=kind))
             lat, lon, ele = self.parse_lat_lon_ele(row)
             if lat == 0.0 or lon == 0.0:
                 continue
@@ -228,6 +253,26 @@ class OpentransportdataSwissSpider(Spider):
                 ref=sloid,
                 extras=tags,
             )
+
+    @staticmethod
+    def platform_kind(means: tuple[str, ...], is_area: bool, has_area: bool) -> str | None:
+        """How OpenStreetMap maps a traffic point: "platform", "stop_position",
+        or None for groupings that OpenStreetMap does not map."""
+        rail = any(m in RAIL_MEANS for m in means)
+        if is_area:
+            # A rail BOARDING_AREA is a platform ("Perron"), which OpenStreetMap
+            # maps as one public_transport=platform for its one or two tracks.
+            # Bus areas such as "Bus" or "Alle" only group the bus stops.
+            return "platform" if rail else None
+        if has_area and rail:
+            # A track along a Perron: OpenStreetMap puts its local_ref on the
+            # railway=stop node where the train halts.
+            return "stop_position"
+        return "platform"
+
+    @staticmethod
+    def natural_key(s: str) -> tuple:
+        return tuple(int(p) if p.isdigit() else p for p in re.split(r"(\d+)", s))
 
     @staticmethod
     def parse_date(d: str | None) -> datetime.date | None:
@@ -252,60 +297,61 @@ class OpentransportdataSwissSpider(Spider):
             return None
 
     @staticmethod
-    def means_tags(means: tuple[str, ...], platform: bool) -> dict[str, str]:
+    def means_tags(means: tuple[str, ...], platform: str | None) -> dict[str, str]:
+        """Tags for a station or stop area (platform=None), a platform
+        (platform="platform"), or a stop position (platform="stop_position"),
+        following how OpenStreetMap maps Swiss public transport."""
         if not means:
-            return {}
+            return {"public_transport": platform or "stop_area"}
 
-        main = means[0]
-        funicular_means = ("CABLE_CAR", "CABLE_RAILWAY")
-        railway_means = ("RACK_RAILWAY", "TRAIN")
-        has_funicular = any(m in means for m in funicular_means)
-        has_railway = any(m in means for m in railway_means)
-
+        # In the feed, CABLE_CAR is an aerial cable car ("Luftseilbahn")
+        # and CABLE_RAILWAY a funicular ("Standseilbahn").
         tags = {
-            "aerialway": "yes" if "CHAIRLIFT" in means else None,
+            "aerialway": "yes" if any(m in means for m in ("CABLE_CAR", "CHAIRLIFT")) else None,
             "bus": "yes" if "BUS" in means else None,
             "elevator": "yes" if "ELEVATOR" in means else None,
             "ferry": "yes" if "BOAT" in means else None,
-            "funicular": "yes" if has_funicular else None,
-            "railway": "yes" if has_railway else None,
+            "funicular": "yes" if "CABLE_RAILWAY" in means else None,
+            "train": "yes" if any(m in means for m in ("RACK_RAILWAY", "TRAIN")) else None,
             "tram": "yes" if "TRAM" in means else None,
             "subway": "yes" if "METRO" in means else None,
         }
+        main = means[0]
+        rail_main = main in RAIL_MEANS
 
-        # Indicate primary means of transportation.
-        primary_tags = {
-            "BOAT": {"amenity": "ferry_terminal"},
-            "BUS": {"highway": "bus_stop"},
-            "CABLE_CAR": {"railway": "station"},
-            "CABLE_RAILWAY": {"railway": "station"},
-            "CHAIRLIFT": {"aerialway": "station"},
-            "ELEVATOR": {"highway": "elevator"},
-            "METRO": {"railway": "station"},
-            "RACK_RAILWAY": {"railway": "station", "rack": "yes"},
-            "TRAM": {"railway": "station"},
-            "TRAIN": {"railway": "station"},
-        }
-        tags.update(primary_tags.get(main, {}))
-
-        # Set tags "public_transport" and (if appropriate) "station".
-        # Values for https://wiki.openstreetmap.org/wiki/Key:station
-        # based on primary means of transportation supplied by feed.
-        station_tags = {
-            "CABLE_CAR": "funicular",
-            "CABLE_RAILWAY": "funicular",
-            "METRO": "subway",
-            "RACK_RAILWAY": "railway",
-            "TRAIN": "railway",
-            "TRAM": "tram",
-        }
-        if platform:
+        if platform == "stop_position":
+            tags["public_transport"] = "stop_position"
+            tags["railway"] = "tram_stop" if main == "TRAM" else "stop"
+        elif platform == "platform":
             tags["public_transport"] = "platform"
-        elif tags.get("railway") == "station":
-            tags["public_transport"] = "station"
-            tags["station"] = station_tags.get(main)
+            if "BUS" in means:
+                tags["highway"] = "bus_stop"
+            if rail_main or (any(m in RAIL_MEANS for m in means) and "BUS" not in means):
+                tags["railway"] = "platform"
         else:
-            tags["public_transport"] = "stop_area"
+            primary_tags = {
+                "BOAT": {"amenity": "ferry_terminal"},
+                "CABLE_CAR": {"aerialway": "station"},
+                "CHAIRLIFT": {"aerialway": "station"},
+                "ELEVATOR": {"highway": "elevator"},
+            }
+            tags.update(primary_tags.get(main, {}))
+            # Values for https://wiki.openstreetmap.org/wiki/Key:station
+            station_tags = {
+                "CABLE_RAILWAY": "funicular",
+                "METRO": "subway",
+                "RACK_RAILWAY": "railway",
+                "TRAIN": "railway",
+                "TRAM": "tram",
+            }
+            if main in station_tags:
+                tags["public_transport"] = "station"
+                tags["railway"] = "station"
+                tags["station"] = station_tags[main]
+            else:
+                # OpenStreetMap maps stop areas as relations; highway=bus_stop
+                # belongs on the platforms, not here.
+                tags["public_transport"] = "stop_area"
 
         return {k: v for k, v in tags.items() if v}
 
