@@ -164,14 +164,16 @@ class OpentransportdataSwissSpider(Spider):
                 tags["ele:regional"] = "%.1f" % ele
 
             tags = {k: v for k, v in tags.items() if v}
-            yield Feature(
-                lat=lat,
-                lon=lon,
-                city=city,
-                country=country,
-                ref=sloid,
-                extras=tags,
-            )
+            # Operating points such as tunnels or junctions are no stops.
+            if row["stopPoint"] == "true":
+                yield Feature(
+                    lat=lat,
+                    lon=lon,
+                    city=city,
+                    country=country,
+                    ref=sloid,
+                    extras=tags,
+                )
             self.stations[sloid] = Station(
                 name=name,
                 operator=operator,
